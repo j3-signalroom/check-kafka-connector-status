@@ -1,4 +1,4 @@
-# check_kafka_connector_status.py
+# Check Kafka Connector Status
 
 A command-line utility that queries the Kafka Connect REST API and reports the
 health of all configured Debezium CDC connectors.
