@@ -1,6 +1,6 @@
 [project]
 name = "check-kafka-connector-status"
-version = "0.1.0"
+version = "0.01.00.000"
 description = "Check the status of Kafka Connect connectors and their tasks"
 readme = "README.md"
 requires-python = ">=3.7"
