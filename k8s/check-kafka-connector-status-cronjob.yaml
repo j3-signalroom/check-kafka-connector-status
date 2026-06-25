@@ -1,0 +1,144 @@
+# Kubernetes CronJob for check_kafka_connector_status.py (Theme 1 detection).
+#
+# Runs the connector health checker on a schedule. STALLED / AT_RISK detection is
+# stateful across runs, so the offset-snapshot state file is kept on a small
+# PersistentVolume that the same CronJob reuses every invocation.
+#
+# Apply with:  kubectl apply -f k8s/check-kafka-connector-status-cronjob.yaml
+#
+# Prereqs you must edit for your cluster:
+#   * NAMESPACE                      — the namespace below
+#   * image                          — a python:3.12-slim (or your base) image; the
+#                                      initContainer pip-installs requests at runtime.
+#                                      For air-gapped clusters, bake an image that
+#                                      already contains requests + the script instead.
+#   * CONNECT_HOST                   — the in-cluster Kafka Connect REST URL
+#   * storageClassName               — a class that supports ReadWriteOnce
+#   * the script delivery mechanism  — here it is mounted from a ConfigMap; for
+#                                      larger/maintained deployments, bake it into
+#                                      the image and drop the ConfigMap + initContainer.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cdc-monitoring
+---
+# Persistent state for the offset-progression snapshot. Without this, every run
+# starts from a fresh baseline and STALLED can never trigger.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: connector-status-state
+  namespace: cdc-monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 64Mi
+  # storageClassName: managed-premium   # <-- set to a RWO class in your cluster
+---
+# The checker script delivered via ConfigMap. Regenerate with:
+#   kubectl create configmap check-kafka-connector-status-script \
+#     --from-file=check_kafka_connector_status.py -n cdc-monitoring \
+#     --dry-run=client -o yaml > /tmp/cm.yaml
+# (Or bake the script into a custom image and remove this ConfigMap + its mount.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: check-kafka-connector-status-script
+  namespace: cdc-monitoring
+data:
+  placeholder: |
+    # Replace this ConfigMap with the real one generated from
+    # check_kafka_connector_status.py (see the kubectl command above).
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: check-kafka-connector-status
+  namespace: cdc-monitoring
+  labels:
+    app: check-kafka-connector-status
+spec:
+  # Every 5 minutes. Pair this cadence with --stall-threshold so a connector is
+  # observed unmoved across at least 2-3 runs before it is flagged STALLED.
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid          # never overlap — state file is single-writer
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 0                # a failed health check should not retry-storm
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: check-kafka-connector-status
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000             # let the non-root user write the PVC
+          # initContainer installs requests into a shared dir so the main
+          # container can run the script. Skip this if you bake a custom image.
+          initContainers:
+            - name: pip-install
+              image: python:3.12-slim
+              command:
+                - sh
+                - -c
+                - "pip install --no-cache-dir --target=/pylibs requests"
+              volumeMounts:
+                - name: pylibs
+                  mountPath: /pylibs
+          containers:
+            - name: checker
+              image: python:3.12-slim
+              env:
+                - name: PYTHONPATH
+                  value: /pylibs
+                - name: CONNECT_HOST
+                  value: "http://kafka-connect.cdc.svc.cluster.local:8083"
+              command:
+                - python
+                - /app/check_kafka_connector_status.py
+              args:
+                - "--host"
+                - "$(CONNECT_HOST)"
+                - "--state-file"
+                - "/state/connector_status_state.json"
+                - "--stall-threshold"
+                - "600"               # 10 min of no offset movement -> STALLED
+                - "--retention-warn"
+                - "302400"            # ~3.5 days paused -> AT_RISK (tune to source retention)
+                - "--unhealthy"       # only print the connectors that matter
+                - "--exit-code"       # non-zero exit -> Job failure -> alertable
+                - "--no-color"        # plain text for log scraping
+              volumeMounts:
+                - name: pylibs
+                  mountPath: /pylibs
+                - name: script
+                  mountPath: /app
+                - name: state
+                  mountPath: /state
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+          volumes:
+            - name: pylibs
+              emptyDir: {}
+            - name: script
+              configMap:
+                name: check-kafka-connector-status-script
+                # When using the real ConfigMap generated from the .py file,
+                # this mounts check_kafka_connector_status.py at /app/.
+            - name: state
+              persistentVolumeClaim:
+                claimName: connector-status-state
